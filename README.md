@@ -2,7 +2,7 @@
 
 **Author:** SeesAll
 
-**Version:** 0.4.0
+**Version:** 0.4.1
 
 SmartCleanup is a safety-first replacement for legacy Rust cleanup plugins such as EntityCleanup. It identifies abandoned structures and selected deployables without repeatedly scanning and mutating the server's entire entity collection.
 
@@ -17,6 +17,7 @@ SmartCleanup is a safety-first replacement for legacy Rust cleanup plugins such 
 - Event protection for RaidableBases, AirfieldEvent, MonumentAddons, CopyPaste, monument entities, unsaved entities, non-Steam owners, and configured skin IDs
 - Extensible protection API for present and future event plugins
 - Invalid-config backup and fail-safe scheduled-cleanup shutdown
+- Admin-only results after every scheduled cleanup
 
 ## Safety Model
 
@@ -55,6 +56,8 @@ Permission: `smartcleanup.admin`
 ```
 
 `dryrun` performs no removals. A successful manual dry-run opens a 120-second confirmation window for `run confirm`. Scheduled cleanup does not require this manual confirmation gate.
+
+After every scheduled run, connected members of the `admin` group and connected users holding `smartcleanup.admin` receive the same results summary. This is controlled by `Notify Connected Admins After Scheduled Cleanup` and does not message ordinary players.
 
 ## Event Plugin Integration
 

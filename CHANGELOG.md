@@ -1,5 +1,12 @@
 # SmartCleanup Changelog
 
+## v0.4.1
+
+- Added an admin-only summary after every scheduled cleanup.
+- Notifications go only to connected members of the `admin` group and connected users holding `smartcleanup.admin`.
+- Added `Notify Connected Admins After Scheduled Cleanup` to configuration.
+- Updated configuration schema to version 8.
+
 ## v0.4.0
 
 - Added layered event protection for RaidableBases, AirfieldEvent, MonumentAddons, CopyPaste, unsaved entities, plugin-owned entities, monument bounds, and protected skin IDs.

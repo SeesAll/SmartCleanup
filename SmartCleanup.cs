@@ -11,7 +11,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("SmartCleanup", "SeesAll", "0.4.0")]
+    [Info("SmartCleanup", "SeesAll", "0.4.1")]
     [Description("Safe adaptive cleanup with persistent activity tracking, event protection, dry-runs, and bounded processing.")]
     public class SmartCleanup : CovalencePlugin
     {
@@ -961,6 +961,10 @@ namespace Oxide.Plugins
             else if (_runtime.AnnounceScheduledCleanup && (job.Mode == CleanupMode.DryRun || job.Removed > 0 || _config.AdvancedLogging.DebugLogging))
             {
                 Broadcast(summary);
+            }
+            else if (_config.AdvancedLogging.NotifyAdminsOnScheduledCleanup)
+            {
+                NotifyAdmins(summary);
             }
         }
 
@@ -2074,6 +2078,17 @@ namespace Oxide.Plugins
             SaveConfig();
         }
 
+        private void NotifyAdmins(string message)
+        {
+            foreach (var player in players.Connected)
+            {
+                if (player.BelongsToGroup("admin") || player.HasPermission(PermAdmin))
+                {
+                    player.Message($"[SmartCleanup] {message}");
+                }
+            }
+        }
+
         private void BackupInvalidConfig()
         {
             try
@@ -2302,7 +2317,7 @@ namespace Oxide.Plugins
 
         private class ConfigData
         {
-            public const int CurrentConfigVersion = 7;
+            public const int CurrentConfigVersion = 8;
 
             [JsonProperty("Config Version")]
             public int ConfigVersion = CurrentConfigVersion;
@@ -2521,6 +2536,9 @@ namespace Oxide.Plugins
 
             [JsonProperty("Log Scheduled Summaries Only When Removals Occur")]
             public bool LogScheduledSummariesOnlyWhenRemovalsOccur = true;
+
+            [JsonProperty("Notify Connected Admins After Scheduled Cleanup")]
+            public bool NotifyAdminsOnScheduledCleanup = true;
         }
 
         private class AdvancedTesting
