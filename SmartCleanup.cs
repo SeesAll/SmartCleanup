@@ -1,19 +1,26 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Reflection;
 using Newtonsoft.Json;
 using Oxide.Core;
 using Oxide.Core.Libraries.Covalence;
+using Oxide.Core.Plugins;
 using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("SmartCleanup", "SeesAll", "0.3.1")]
-    [Description("Adaptive entity cleanup with profile-based tuning, tracked candidates, dry-runs, and bounded batch processing.")]
+    [Info("SmartCleanup", "SeesAll", "0.4.0")]
+    [Description("Safe adaptive cleanup with persistent activity tracking, event protection, dry-runs, and bounded processing.")]
     public class SmartCleanup : CovalencePlugin
     {
         private const string PermAdmin = "smartcleanup.admin";
+        private const string DataFileName = "SmartCleanup_State";
+        private const double RunConfirmationLifetimeSeconds = 120d;
+
+        [PluginReference] private Plugin RaidableBases;
+        [PluginReference] private Plugin MonumentAddons;
 
         private ConfigData _config;
         private RuntimeSettings _runtime;
@@ -24,11 +31,27 @@ namespace Oxide.Plugins
         private readonly HashSet<string> _whitelist = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> _neverCleanupPrefabs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> _alwaysCleanupPrefabs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<uint> _airfieldEventEntities = new HashSet<uint>();
+        private readonly HashSet<uint> _registeredProtectedEntities = new HashSet<uint>();
+        private readonly Dictionary<uint, double> _temporaryProtectedUntilUtc = new Dictionary<uint, double>();
+        private readonly Dictionary<string, double> _pendingRunConfirmations = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
 
         private bool _initialized;
         private bool _runInProgress;
+        private bool _rebuildInProgress;
+        private bool _airfieldEventActive;
+        private bool _dataDirty;
+        private bool _configLoadFailed;
         private Timer _scheduledTimer;
+        private Timer _dataSaveTimer;
+        private Timer _reconciliationTimer;
         private CleanupJob _activeJob;
+        private StoredData _storedData;
+        private List<NetworkableId> _rebuildIds;
+        private Dictionary<uint, TrackedEntity> _rebuildPrevious;
+        private int _rebuildIndex;
+        private bool _rebuildManual;
+        private string _rebuildRequesterId;
 
         private enum CleanupMode
         {
@@ -72,6 +95,8 @@ namespace Oxide.Plugins
             public int SkippedProtectedInsidePrivilege;
             public int SkippedProtectedByCupboardAuth;
             public int SkippedProtectedOutsideDisabled;
+            public int SkippedProtectedByEvent;
+            public int SkippedProtectedByConnectedStructure;
             public int SkippedWhitelisted;
             public int SkippedInactiveTooSoon;
             public int SkippedHealthTooHigh;
@@ -83,6 +108,7 @@ namespace Oxide.Plugins
             public string RequesterId;
             public string RequesterName;
             public double StartedUtc;
+            public readonly Dictionary<uint, bool> ConnectedStructureProtection = new Dictionary<uint, bool>();
         }
 
         private class TrackedEntity
@@ -93,9 +119,24 @@ namespace Oxide.Plugins
             public DeployableCategory DeployableCategory;
             public string ShortPrefabName;
             public string PrefabName;
-            public double SpawnedUtc;
-            public double LastDamagedUtc;
+            public double FirstSeenUtc;
+            public double LastActivityUtc;
             public double LastRefreshUtc;
+            public bool InsideMonument;
+        }
+
+        private class PersistedEntityState
+        {
+            public double FirstSeenUtc;
+            public double LastActivityUtc;
+        }
+
+        private class StoredData
+        {
+            public long WipeCreatedUtcTicks;
+            public Dictionary<ulong, double> LastOwnerSeenUtc = new Dictionary<ulong, double>();
+            public Dictionary<uint, PersistedEntityState> EntityStates = new Dictionary<uint, PersistedEntityState>();
+            public Dictionary<uint, double> TemporaryProtectedUntilUtc = new Dictionary<uint, double>();
         }
 
         private class RuntimeSettings
@@ -129,25 +170,52 @@ namespace Oxide.Plugins
 
         private void OnServerInitialized()
         {
+            LoadStoredData();
             BuildDeployableLookup();
             RebuildWhitelist();
             RebuildPrefabOverrides();
             ResolveRuntimeSettings(writeToConfig: false, logResolution: true);
             SeedRecentPlayers();
-            BuildTrackingIndex();
-            StartSchedule();
             _initialized = true;
-            Puts($"Tracking {_tracked.Count} cleanup candidates.");
+            StartDataSaveTimer();
+            StartTrackingIndexRebuild(manualRequest: false, requester: null);
         }
 
         private void Unload()
         {
             _scheduledTimer?.Destroy();
             _scheduledTimer = null;
+            _dataSaveTimer?.Destroy();
+            _dataSaveTimer = null;
+            _reconciliationTimer?.Destroy();
+            _reconciliationTimer = null;
+            SaveStoredData(force: true);
             _tracked.Clear();
             _lastOwnerSeenUtc.Clear();
+            _airfieldEventEntities.Clear();
+            _registeredProtectedEntities.Clear();
+            _temporaryProtectedUntilUtc.Clear();
+            _pendingRunConfirmations.Clear();
+            _rebuildIds = null;
+            _rebuildPrevious = null;
             _activeJob = null;
             _runInProgress = false;
+            _rebuildInProgress = false;
+            _initialized = false;
+        }
+
+        private void OnServerSave()
+        {
+            SaveStoredData(force: false);
+        }
+
+        private void OnNewSave(string filename)
+        {
+            _lastOwnerSeenUtc.Clear();
+            _temporaryProtectedUntilUtc.Clear();
+            _storedData = new StoredData { WipeCreatedUtcTicks = GetWipeCreatedUtcTicks() };
+            _dataDirty = true;
+            SaveStoredData(force: true);
         }
 
         private void OnPlayerConnected(BasePlayer player)
@@ -158,6 +226,7 @@ namespace Oxide.Plugins
             }
 
             _lastOwnerSeenUtc[player.userID] = UtcNow();
+            MarkDataDirty();
         }
 
         private void OnPlayerDisconnected(BasePlayer player, string reason)
@@ -168,6 +237,7 @@ namespace Oxide.Plugins
             }
 
             _lastOwnerSeenUtc[player.userID] = UtcNow();
+            MarkDataDirty();
         }
 
         private void OnEntitySpawned(BaseNetworkable networkable)
@@ -183,7 +253,21 @@ namespace Oxide.Plugins
                 return;
             }
 
-            NextTick(() => TryTrackEntity(entity));
+            NextTick(() =>
+            {
+                if (entity == null || entity.IsDestroyed || entity.net == null)
+                {
+                    return;
+                }
+
+                var id = (uint)entity.net.ID.Value;
+                if (_airfieldEventActive)
+                {
+                    _airfieldEventEntities.Add(id);
+                }
+
+                TryTrackEntity(entity);
+            });
         }
 
         private void OnEntityKill(BaseNetworkable networkable)
@@ -194,7 +278,17 @@ namespace Oxide.Plugins
                 return;
             }
 
-            _tracked.Remove((uint)entity.net.ID.Value);
+            var id = (uint)entity.net.ID.Value;
+            _tracked.Remove(id);
+            _airfieldEventEntities.Remove(id);
+            _registeredProtectedEntities.Remove(id);
+            _temporaryProtectedUntilUtc.Remove(id);
+            if (_storedData?.EntityStates != null)
+            {
+                _storedData.EntityStates.Remove(id);
+            }
+
+            MarkDataDirty();
         }
 
         private void OnEntityTakeDamage(BaseCombatEntity combatEntity, HitInfo info)
@@ -207,9 +301,67 @@ namespace Oxide.Plugins
             TrackedEntity tracked;
             if (_tracked.TryGetValue((uint)combatEntity.net.ID.Value, out tracked))
             {
-                tracked.LastDamagedUtc = UtcNow();
-                tracked.LastRefreshUtc = tracked.LastDamagedUtc;
+                MarkEntityActivity(tracked, UtcNow());
             }
+        }
+
+        private void OnStructureRepair(BaseCombatEntity entity, BasePlayer player)
+        {
+            MarkEntityActivity(entity);
+        }
+
+        private void OnStructureUpgrade(BuildingBlock block, BasePlayer player, BuildingGrade.Enum grade)
+        {
+            MarkEntityActivity(block);
+        }
+
+        private void AirfieldEventStarted()
+        {
+            _airfieldEventActive = true;
+            Puts("AirfieldEvent started; newly spawned entities will be protected from cleanup.");
+        }
+
+        private void AirfieldEventEnded()
+        {
+            _airfieldEventActive = false;
+            _airfieldEventEntities.Clear();
+            Puts("AirfieldEvent ended; temporary spawn protection was released.");
+        }
+
+        private void OnPasteFinished(List<BaseEntity> pastedEntities, string filename, BasePlayer player, Vector3 position)
+        {
+            if (!_config.EventSafety.Enabled || pastedEntities == null || _config.EventSafety.CopyPasteProtectionHours <= 0d)
+            {
+                return;
+            }
+
+            var expires = UtcNow() + (_config.EventSafety.CopyPasteProtectionHours * 3600d);
+            foreach (var entity in pastedEntities)
+            {
+                if (entity?.net == null || entity.IsDestroyed)
+                {
+                    continue;
+                }
+
+                _temporaryProtectedUntilUtc[(uint)entity.net.ID.Value] = expires;
+            }
+
+            MarkDataDirty();
+        }
+
+        private void OnRaidableBaseStarted(object payload)
+        {
+            RegisterRaidableBasePayload(payload);
+        }
+
+        private void OnRaidableBaseEnded(object payload)
+        {
+            UnregisterRaidableBasePayload(payload);
+        }
+
+        private void OnRaidableBaseDespawned(object payload)
+        {
+            UnregisterRaidableBasePayload(payload);
         }
 
         #endregion
@@ -218,7 +370,7 @@ namespace Oxide.Plugins
 
         private void CommandSmartCleanup(IPlayer player, string command, string[] args)
         {
-            if (player == null || !player.HasPermission(PermAdmin))
+            if (!IsAuthorized(player))
             {
                 Reply(player, "You do not have permission to use SmartCleanup.");
                 return;
@@ -226,14 +378,14 @@ namespace Oxide.Plugins
 
             if (args == null || args.Length == 0)
             {
-                Reply(player, "SmartCleanup commands: /smartcleanup status, dryrun, run, retune, rebuild, help");
+                Reply(player, "SmartCleanup commands: /smartcleanup status, dryrun, run confirm, retune, rebuild, help");
                 return;
             }
 
             switch (args[0].ToLowerInvariant())
             {
                 case "help":
-                    Reply(player, "Commands: /smartcleanup status, /smartcleanup dryrun, /smartcleanup run, /smartcleanup retune, /smartcleanup rebuild");
+                    Reply(player, "Commands: /smartcleanup status, /smartcleanup dryrun, /smartcleanup run confirm, /smartcleanup retune, /smartcleanup rebuild");
                     break;
 
                 case "status":
@@ -241,25 +393,38 @@ namespace Oxide.Plugins
                     break;
 
                 case "dryrun":
-                    if (_runInProgress)
+                    if (_runInProgress || _rebuildInProgress)
                     {
-                        Reply(player, "A SmartCleanup job is already running.");
+                        Reply(player, "A SmartCleanup job or index rebuild is already running.");
                         return;
                     }
 
                     StartCleanupJob(CleanupMode.DryRun, manualRequest: true, trigger: $"manual dryrun by {player.Name}", requester: player);
-                    Reply(player, "Started SmartCleanup dry-run.");
                     break;
 
                 case "run":
-                    if (_runInProgress)
+                    if (_runInProgress || _rebuildInProgress)
                     {
-                        Reply(player, "A SmartCleanup job is already running.");
+                        Reply(player, "A SmartCleanup job or index rebuild is already running.");
                         return;
                     }
 
+                    if (args.Length < 2 || !args[1].Equals("confirm", StringComparison.OrdinalIgnoreCase))
+                    {
+                        Reply(player, "Cleanup execution is locked. Run /smartcleanup dryrun first, review the result, then use /smartcleanup run confirm within 120 seconds.");
+                        return;
+                    }
+
+                    double confirmationExpires;
+                    if (!_pendingRunConfirmations.TryGetValue(player.Id, out confirmationExpires) || confirmationExpires < UtcNow())
+                    {
+                        _pendingRunConfirmations.Remove(player.Id);
+                        Reply(player, "No current dry-run approval exists. Run /smartcleanup dryrun first.");
+                        return;
+                    }
+
+                    _pendingRunConfirmations.Remove(player.Id);
                     StartCleanupJob(CleanupMode.Execute, manualRequest: true, trigger: $"manual run by {player.Name}", requester: player);
-                    Reply(player, "Started SmartCleanup cleanup run.");
                     break;
 
                 case "retune":
@@ -271,10 +436,15 @@ namespace Oxide.Plugins
                     break;
 
                 case "rebuild":
+                    if (_runInProgress || _rebuildInProgress)
+                    {
+                        Reply(player, "A SmartCleanup job or index rebuild is already running.");
+                        return;
+                    }
+
                     RebuildWhitelist();
                     RebuildPrefabOverrides();
-                    BuildTrackingIndex();
-                    Reply(player, $"Rebuilt tracking index. Now tracking {_tracked.Count} candidates.");
+                    StartTrackingIndexRebuild(manualRequest: true, requester: player);
                     break;
 
                 default:
@@ -287,21 +457,88 @@ namespace Oxide.Plugins
 
         #region Tracking / Classification
 
-        private void BuildTrackingIndex()
+        private void StartTrackingIndexRebuild(bool manualRequest, IPlayer requester)
         {
-            var previous = new Dictionary<uint, TrackedEntity>(_tracked);
+            if (_rebuildInProgress || _runInProgress)
+            {
+                Reply(requester, "A SmartCleanup job or index rebuild is already running.");
+                return;
+            }
+
+            _rebuildInProgress = true;
+            _rebuildManual = manualRequest;
+            _rebuildRequesterId = requester?.Id;
+            _rebuildPrevious = new Dictionary<uint, TrackedEntity>(_tracked);
             _tracked.Clear();
+            _rebuildIds = new List<NetworkableId>();
+            _rebuildIndex = 0;
 
             foreach (var networkable in BaseNetworkable.serverEntities)
             {
-                var entity = networkable as BaseEntity;
-                if (entity == null)
+                if (networkable?.net != null)
                 {
-                    continue;
+                    _rebuildIds.Add(networkable.net.ID);
                 }
-
-                TryTrackEntity(entity, previous);
             }
+
+            if (manualRequest)
+            {
+                Reply(requester, $"Started bounded tracking rebuild for {_rebuildIds.Count} server entities.");
+            }
+
+            ProcessTrackingIndexBatch();
+        }
+
+        private void ProcessTrackingIndexBatch()
+        {
+            if (!_rebuildInProgress || _rebuildIds == null)
+            {
+                return;
+            }
+
+            var budget = Mathf.Clamp(_config.AdvancedPerformance.IndexCandidatesPerTick, 50, 5000);
+            var processed = 0;
+            while (processed < budget && _rebuildIndex < _rebuildIds.Count)
+            {
+                var entity = BaseNetworkable.serverEntities.Find(_rebuildIds[_rebuildIndex++]) as BaseEntity;
+                processed++;
+                if (entity != null && !entity.IsDestroyed)
+                {
+                    TryTrackEntity(entity, _rebuildPrevious);
+                }
+            }
+
+            if (_rebuildIndex < _rebuildIds.Count)
+            {
+                NextTick(ProcessTrackingIndexBatch);
+                return;
+            }
+
+            FinishTrackingIndexRebuild();
+        }
+
+        private void FinishTrackingIndexRebuild()
+        {
+            _rebuildInProgress = false;
+            _rebuildIds = null;
+            _rebuildPrevious = null;
+            PruneStoredEntityStates();
+            SaveStoredData(force: false);
+
+            var message = $"Tracking rebuild complete. Tracking {_tracked.Count} cleanup candidate(s).";
+            if (_rebuildManual && !string.IsNullOrEmpty(_rebuildRequesterId))
+            {
+                Reply(players.FindPlayerById(_rebuildRequesterId), message);
+            }
+            else
+            {
+                Puts(message);
+            }
+
+            _rebuildManual = false;
+            _rebuildRequesterId = null;
+            StartSchedule();
+            StartReconciliationTimer();
         }
 
         private void TryTrackEntity(BaseEntity entity, Dictionary<uint, TrackedEntity> previous = null)
@@ -339,6 +576,11 @@ namespace Oxide.Plugins
                     previous.TryGetValue(id, out existing);
                 }
 
+                PersistedEntityState persistedState = null;
+                _storedData?.EntityStates?.TryGetValue(id, out persistedState);
+                var firstSeen = existing?.FirstSeenUtc ?? persistedState?.FirstSeenUtc ?? now;
+                var lastActivity = Math.Max(existing?.LastActivityUtc ?? 0d, persistedState?.LastActivityUtc ?? 0d);
+
                 tracked = new TrackedEntity
                 {
                     NetId = id,
@@ -347,12 +589,14 @@ namespace Oxide.Plugins
                     DeployableCategory = kind == EntityKind.Deployable ? GetDeployableCategory(entity) : DeployableCategory.Unknown,
                     ShortPrefabName = entity.ShortPrefabName ?? string.Empty,
                     PrefabName = entity.PrefabName ?? string.Empty,
-                    SpawnedUtc = existing?.SpawnedUtc ?? now,
-                    LastDamagedUtc = existing?.LastDamagedUtc ?? 0d,
-                    LastRefreshUtc = now
+                    FirstSeenUtc = firstSeen,
+                    LastActivityUtc = lastActivity,
+                    LastRefreshUtc = now,
+                    InsideMonument = IsInsideMonument(entity.transform.position)
                 };
 
                 _tracked[id] = tracked;
+                StoreTrackedEntityState(tracked);
                 return;
             }
 
@@ -362,6 +606,8 @@ namespace Oxide.Plugins
             tracked.ShortPrefabName = entity.ShortPrefabName ?? string.Empty;
             tracked.PrefabName = entity.PrefabName ?? string.Empty;
             tracked.LastRefreshUtc = now;
+            tracked.InsideMonument = IsInsideMonument(entity.transform.position);
+            StoreTrackedEntityState(tracked);
         }
 
         private EntityKind Classify(BaseEntity entity)
@@ -586,6 +832,12 @@ namespace Oxide.Plugins
             _scheduledTimer?.Destroy();
             _scheduledTimer = null;
 
+            if (_configLoadFailed)
+            {
+                PrintError("Scheduled cleanup is disabled because the configuration failed to load. Repair or regenerate the config, then reload SmartCleanup.");
+                return;
+            }
+
             if (_config.AdvancedTesting.DisableScheduledCleanupForTesting)
             {
                 Puts("Scheduled cleanup is disabled by testing mode.");
@@ -600,7 +852,7 @@ namespace Oxide.Plugins
 
             _scheduledTimer = timer.Every((float)(_runtime.ScheduledEvaluationIntervalMinutes * 60d), () =>
             {
-                if (_runInProgress)
+                if (_runInProgress || _rebuildInProgress)
                 {
                     return;
                 }
@@ -613,6 +865,12 @@ namespace Oxide.Plugins
 
         private void StartCleanupJob(CleanupMode mode, bool manualRequest, string trigger, IPlayer requester)
         {
+            if (_runInProgress || _rebuildInProgress)
+            {
+                Reply(requester, "A SmartCleanup job or index rebuild is already running.");
+                return;
+            }
+
             _runInProgress = true;
             _activeJob = new CleanupJob
             {
@@ -672,7 +930,7 @@ namespace Oxide.Plugins
 
             var elapsedSeconds = Math.Max(0d, UtcNow() - job.StartedUtc);
             var matchCount = job.BuildingMatches + job.DeployableMatches;
-            var protectedBreakdown = $"Protected={job.SkippedProtected} [Category={job.SkippedProtectedByCategory}, Ownerless={job.SkippedProtectedOwnerless}, Recent={job.SkippedProtectedByRecentActivity}, InsidePrivilege={job.SkippedProtectedInsidePrivilege}, CupboardAuth={job.SkippedProtectedByCupboardAuth}, OutsideDisabled={job.SkippedProtectedOutsideDisabled}]";
+            var protectedBreakdown = $"Protected={job.SkippedProtected} [Event={job.SkippedProtectedByEvent}, Connected={job.SkippedProtectedByConnectedStructure}, Category={job.SkippedProtectedByCategory}, Ownerless={job.SkippedProtectedOwnerless}, Recent={job.SkippedProtectedByRecentActivity}, InsidePrivilege={job.SkippedProtectedInsidePrivilege}, CupboardAuth={job.SkippedProtectedByCupboardAuth}, OutsideDisabled={job.SkippedProtectedOutsideDisabled}]";
             var actionSegment = job.Mode == CleanupMode.DryRun
                 ? $"WouldRemove={matchCount}, Removed=0"
                 : $"Matches={matchCount}, Removed={job.Removed}";
@@ -693,6 +951,11 @@ namespace Oxide.Plugins
                 if (requester != null)
                 {
                     Reply(requester, summary);
+                    if (job.Mode == CleanupMode.DryRun)
+                    {
+                        _pendingRunConfirmations[job.RequesterId] = UtcNow() + RunConfirmationLifetimeSeconds;
+                        Reply(requester, "Dry-run reviewed. To execute this result, use /smartcleanup run confirm within 120 seconds.");
+                    }
                 }
             }
             else if (_runtime.AnnounceScheduledCleanup && (job.Mode == CleanupMode.DryRun || job.Removed > 0 || _config.AdvancedLogging.DebugLogging))
@@ -764,7 +1027,7 @@ namespace Oxide.Plugins
                 return;
             }
 
-            var evaluation = ShouldCleanup(entity, tracked);
+            var evaluation = ShouldCleanup(entity, tracked, job);
             if (!evaluation.ShouldRemove)
             {
                 switch (evaluation.Reason)
@@ -795,6 +1058,14 @@ namespace Oxide.Plugins
                     case SkipReason.ProtectedOutsideDisabled:
                         job.SkippedProtected++;
                         job.SkippedProtectedOutsideDisabled++;
+                        break;
+                    case SkipReason.ProtectedByEvent:
+                        job.SkippedProtected++;
+                        job.SkippedProtectedByEvent++;
+                        break;
+                    case SkipReason.ProtectedByConnectedStructure:
+                        job.SkippedProtected++;
+                        job.SkippedProtectedByConnectedStructure++;
                         break;
                     case SkipReason.TooSoon:
                         job.SkippedInactiveTooSoon++;
@@ -833,6 +1104,8 @@ namespace Oxide.Plugins
             ProtectedInsidePrivilege,
             ProtectedByCupboardAuth,
             ProtectedOutsideDisabled,
+            ProtectedByEvent,
+            ProtectedByConnectedStructure,
             TooSoon,
             HealthTooHigh
         }
@@ -843,9 +1116,21 @@ namespace Oxide.Plugins
             public SkipReason Reason;
         }
 
-        private EvaluationResult ShouldCleanup(BaseEntity entity, TrackedEntity tracked)
+        private EvaluationResult ShouldCleanup(BaseEntity entity, TrackedEntity tracked, CleanupJob job)
         {
             var result = new EvaluationResult { ShouldRemove = false, Reason = SkipReason.None };
+
+            if (IsProtectedEventEntity(entity, tracked))
+            {
+                result.Reason = SkipReason.ProtectedByEvent;
+                return result;
+            }
+
+            if (tracked.Kind == EntityKind.Building && IsConnectedStructureProtected(entity as BuildingBlock, job))
+            {
+                result.Reason = SkipReason.ProtectedByConnectedStructure;
+                return result;
+            }
 
             if (tracked.Kind == EntityKind.Building && !_runtime.CleanupBuildings)
             {
@@ -882,7 +1167,8 @@ namespace Oxide.Plugins
             var privilege = entity.GetBuildingPrivilege();
             var hasPrivilege = privilege != null;
             var now = UtcNow();
-            var ageHours = Math.Max(0d, (now - tracked.SpawnedUtc) / 3600d);
+            var lastEntityActivity = Math.Max(tracked.FirstSeenUtc, tracked.LastActivityUtc);
+            var ageHours = Math.Max(0d, (now - lastEntityActivity) / 3600d);
             var healthFraction = GetHealthFraction(entity);
 
             if (hasPrivilege)
@@ -954,6 +1240,12 @@ namespace Oxide.Plugins
 
             if (writeToConfig)
             {
+                if (_config.ServerProfile == 1 && _config.AutoTuneWriteToConfig)
+                {
+                    _config.ServerProfile = resolvedProfile;
+                    PrintWarning($"AutoTuneWriteToConfig selected and saved profile {resolvedProfile} ({settings.ResolvedProfileName}). Auto-detection is now pinned until ServerProfile is set back to 1.");
+                }
+
                 SaveConfig();
             }
 
@@ -1159,16 +1451,28 @@ namespace Oxide.Plugins
                 return;
             }
 
-            settings.MaxCandidatesPerTick = Mathf.Clamp(_config.AdvancedPerformance.MaxCandidatesPerTick, 10, 1000);
             settings.AnnounceScheduledCleanup = _config.AdvancedLogging.AnnounceScheduledCleanup;
             settings.CleanupBuildings = _config.CategorySettings.CleanupBuildings;
             settings.CleanupDeployables = _config.CategorySettings.CleanupDeployables;
             settings.RemoveInsidePrivilege = _config.AdvancedSafety.AllowInsidePrivilegeCleanup;
             settings.RemoveOutsidePrivilege = _config.AdvancedSafety.AllowOutsidePrivilegeCleanup;
             settings.CheckCupboardAuthorization = _config.AdvancedSafety.CheckCupboardAuthorization;
-            settings.ProtectRecentlyActivePlayersHours = Math.Max(0d, _config.AdvancedSafety.ProtectRecentlyActivePlayersHours);
-            settings.OutsideHealthFractionThreshold = Mathf.Clamp(_config.AdvancedThresholds.OutsidePrivilegeHealthFractionThreshold, 0f, 1f);
-            settings.InsideHealthFractionThreshold = Mathf.Clamp(_config.AdvancedThresholds.InsidePrivilegeHealthFractionThreshold, 0f, 1f);
+
+            if (settings.ResolvedProfile == 5 || _config.AdvancedPerformance.OverrideProfileBatchSize)
+            {
+                settings.MaxCandidatesPerTick = Mathf.Clamp(_config.AdvancedPerformance.MaxCandidatesPerTick, 10, 1000);
+            }
+
+            if (settings.ResolvedProfile == 5 || _config.AdvancedSafety.OverrideProfileRecentActivityProtection)
+            {
+                settings.ProtectRecentlyActivePlayersHours = Math.Max(0d, _config.AdvancedSafety.ProtectRecentlyActivePlayersHours);
+            }
+
+            if (settings.ResolvedProfile == 5 || _config.AdvancedThresholds.OverrideProfileHealthThresholds)
+            {
+                settings.OutsideHealthFractionThreshold = Mathf.Clamp(_config.AdvancedThresholds.OutsidePrivilegeHealthFractionThreshold, 0f, 1f);
+                settings.InsideHealthFractionThreshold = Mathf.Clamp(_config.AdvancedThresholds.InsidePrivilegeHealthFractionThreshold, 0f, 1f);
+            }
 
             if (!_config.AdvancedTimingOverrides.EnableAdvancedTimingOverrides)
             {
@@ -1199,6 +1503,387 @@ namespace Oxide.Plugins
         #endregion
 
         #region Helpers
+
+        private bool IsAuthorized(IPlayer player)
+        {
+            return player != null && (player.IsServer || player.HasPermission(PermAdmin));
+        }
+
+        private void MarkEntityActivity(BaseEntity entity)
+        {
+            if (entity?.net == null)
+            {
+                return;
+            }
+
+            TrackedEntity tracked;
+            if (_tracked.TryGetValue((uint)entity.net.ID.Value, out tracked))
+            {
+                MarkEntityActivity(tracked, UtcNow());
+            }
+        }
+
+        private void MarkEntityActivity(TrackedEntity tracked, double timestamp)
+        {
+            if (tracked == null)
+            {
+                return;
+            }
+
+            tracked.LastActivityUtc = timestamp;
+            tracked.LastRefreshUtc = timestamp;
+            StoreTrackedEntityState(tracked);
+        }
+
+        private long GetWipeCreatedUtcTicks()
+        {
+            try
+            {
+                return SaveRestore.SaveCreatedTime.ToUniversalTime().Ticks;
+            }
+            catch
+            {
+                return 0L;
+            }
+        }
+
+        private void LoadStoredData()
+        {
+            try
+            {
+                _storedData = Interface.Oxide.DataFileSystem.ReadObject<StoredData>(DataFileName) ?? new StoredData();
+            }
+            catch (Exception ex)
+            {
+                PrintWarning($"Could not read persistent state; starting a fresh state file. {ex.Message}");
+                _storedData = new StoredData();
+            }
+
+            var wipeTicks = GetWipeCreatedUtcTicks();
+            if (_storedData.WipeCreatedUtcTicks != 0L && wipeTicks != 0L && _storedData.WipeCreatedUtcTicks != wipeTicks)
+            {
+                Puts("Detected a new save; discarded cleanup activity state from the previous wipe.");
+                _storedData = new StoredData();
+            }
+
+            _storedData.WipeCreatedUtcTicks = wipeTicks;
+            _storedData.LastOwnerSeenUtc = _storedData.LastOwnerSeenUtc ?? new Dictionary<ulong, double>();
+            _storedData.EntityStates = _storedData.EntityStates ?? new Dictionary<uint, PersistedEntityState>();
+            _storedData.TemporaryProtectedUntilUtc = _storedData.TemporaryProtectedUntilUtc ?? new Dictionary<uint, double>();
+
+            _lastOwnerSeenUtc.Clear();
+            foreach (var pair in _storedData.LastOwnerSeenUtc)
+            {
+                _lastOwnerSeenUtc[pair.Key] = pair.Value;
+            }
+
+            _temporaryProtectedUntilUtc.Clear();
+            var now = UtcNow();
+            foreach (var pair in _storedData.TemporaryProtectedUntilUtc)
+            {
+                if (pair.Value > now)
+                {
+                    _temporaryProtectedUntilUtc[pair.Key] = pair.Value;
+                }
+            }
+
+            _dataDirty = false;
+        }
+
+        private void MarkDataDirty()
+        {
+            _dataDirty = true;
+        }
+
+        private void StoreTrackedEntityState(TrackedEntity tracked)
+        {
+            if (tracked == null)
+            {
+                return;
+            }
+
+            if (_storedData == null)
+            {
+                _storedData = new StoredData { WipeCreatedUtcTicks = GetWipeCreatedUtcTicks() };
+            }
+
+            _storedData.EntityStates[tracked.NetId] = new PersistedEntityState
+            {
+                FirstSeenUtc = tracked.FirstSeenUtc,
+                LastActivityUtc = tracked.LastActivityUtc
+            };
+            MarkDataDirty();
+        }
+
+        private void PruneStoredEntityStates()
+        {
+            if (_storedData?.EntityStates == null)
+            {
+                return;
+            }
+
+            var activeIds = new HashSet<uint>(_tracked.Keys);
+            foreach (var id in _storedData.EntityStates.Keys.Where(id => !activeIds.Contains(id)).ToList())
+            {
+                _storedData.EntityStates.Remove(id);
+                MarkDataDirty();
+            }
+        }
+
+        private void StartDataSaveTimer()
+        {
+            _dataSaveTimer?.Destroy();
+            var seconds = (float)(Math.Max(1d, _config.AdvancedPerformance.DataSaveIntervalMinutes) * 60d);
+            _dataSaveTimer = timer.Every(seconds, () => SaveStoredData(force: false));
+        }
+
+        private void SaveStoredData(bool force)
+        {
+            if (_storedData == null || (!force && !_dataDirty))
+            {
+                return;
+            }
+
+            _storedData.WipeCreatedUtcTicks = GetWipeCreatedUtcTicks();
+            _storedData.LastOwnerSeenUtc = new Dictionary<ulong, double>(_lastOwnerSeenUtc);
+            _storedData.TemporaryProtectedUntilUtc = new Dictionary<uint, double>(_temporaryProtectedUntilUtc);
+
+            try
+            {
+                Interface.Oxide.DataFileSystem.WriteObject(DataFileName, _storedData);
+                _dataDirty = false;
+            }
+            catch (Exception ex)
+            {
+                PrintError($"Could not save persistent state: {ex.Message}");
+            }
+        }
+
+        private void StartReconciliationTimer()
+        {
+            _reconciliationTimer?.Destroy();
+            if (_config.AdvancedPerformance.ReconciliationIntervalHours <= 0d)
+            {
+                return;
+            }
+
+            var seconds = (float)(_config.AdvancedPerformance.ReconciliationIntervalHours * 3600d);
+            _reconciliationTimer = timer.Every(seconds, () =>
+            {
+                if (!_runInProgress && !_rebuildInProgress)
+                {
+                    StartTrackingIndexRebuild(manualRequest: false, requester: null);
+                }
+            });
+        }
+
+        private bool IsInsideMonument(Vector3 position)
+        {
+            if (!_config.EventSafety.Enabled || !_config.EventSafety.ProtectEntitiesInsideMonuments || TerrainMeta.Path?.Monuments == null)
+            {
+                return false;
+            }
+
+            foreach (var monument in TerrainMeta.Path.Monuments)
+            {
+                if (monument != null && monument.IsInBounds(position))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private bool IsProtectedEventEntity(BaseEntity entity, TrackedEntity tracked)
+        {
+            if (!_config.EventSafety.Enabled || entity == null)
+            {
+                return false;
+            }
+
+            var id = entity.net == null ? 0u : (uint)entity.net.ID.Value;
+            if (id != 0u && (_airfieldEventEntities.Contains(id) || _registeredProtectedEntities.Contains(id)))
+            {
+                return true;
+            }
+
+            double temporaryExpiry;
+            if (id != 0u && _temporaryProtectedUntilUtc.TryGetValue(id, out temporaryExpiry))
+            {
+                if (temporaryExpiry > UtcNow())
+                {
+                    return true;
+                }
+
+                _temporaryProtectedUntilUtc.Remove(id);
+                MarkDataDirty();
+            }
+
+            if (_config.EventSafety.ProtectUnsavedEntities && !entity.enableSaving)
+            {
+                return true;
+            }
+
+            if (_config.EventSafety.ProtectNonSteamOwnedEntities && entity.OwnerID != 0UL && entity.OwnerID < 76561197960265728UL)
+            {
+                return true;
+            }
+
+            if (_config.EventSafety.ProtectedSkinIds != null && _config.EventSafety.ProtectedSkinIds.Contains(entity.skinID))
+            {
+                return true;
+            }
+
+            if (_config.EventSafety.ProtectEntitiesInsideMonuments && (tracked?.InsideMonument == true || IsInsideMonument(entity.transform.position)))
+            {
+                return true;
+            }
+
+            if (_config.EventSafety.UseKnownPluginIntegrations)
+            {
+                if (MonumentAddons != null && ConvertToBool(MonumentAddons.Call("API_IsMonumentEntity", entity)))
+                {
+                    return true;
+                }
+
+                if (RaidableBases != null && ConvertToBool(RaidableBases.Call("HasEventEntity", entity)))
+                {
+                    return true;
+                }
+            }
+
+            var hookResult = Interface.CallHook("CanSmartCleanupEntity", entity);
+            return hookResult is bool && !(bool)hookResult;
+        }
+
+        private bool ConvertToBool(object value)
+        {
+            if (value is bool)
+            {
+                return (bool)value;
+            }
+
+            if (value == null)
+            {
+                return false;
+            }
+
+            bool result;
+            return bool.TryParse(value.ToString(), out result) && result;
+        }
+
+        private bool IsConnectedStructureProtected(BuildingBlock block, CleanupJob job)
+        {
+            if (!_config.AdvancedSafety.ProtectEntireConnectedStructure || block == null || block.buildingID == 0u)
+            {
+                return false;
+            }
+
+            bool cached;
+            if (job != null && job.ConnectedStructureProtection.TryGetValue(block.buildingID, out cached))
+            {
+                return cached;
+            }
+
+            var protectedStructure = false;
+            var building = block.GetBuilding();
+            if (building != null)
+            {
+                if (!_runtime.RemoveInsidePrivilege && building.buildingPrivileges != null && building.buildingPrivileges.Any(privilege => privilege != null && !privilege.IsDestroyed))
+                {
+                    protectedStructure = true;
+                }
+
+                if (!protectedStructure && building.buildingBlocks != null)
+                {
+                    foreach (var buildingBlock in building.buildingBlocks)
+                    {
+                        if (buildingBlock == null || buildingBlock.IsDestroyed)
+                        {
+                            continue;
+                        }
+
+                        if (IsProtectedByRecentActivity(buildingBlock.OwnerID))
+                        {
+                            protectedStructure = true;
+                            break;
+                        }
+
+                        if (_runtime.CheckCupboardAuthorization && building.buildingPrivileges != null && building.buildingPrivileges.Any(privilege => privilege != null && !privilege.IsDestroyed && privilege.IsAuthed(buildingBlock.OwnerID)))
+                        {
+                            protectedStructure = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (job != null)
+            {
+                job.ConnectedStructureProtection[block.buildingID] = protectedStructure;
+            }
+
+            return protectedStructure;
+        }
+
+        [HookMethod("API_ProtectEntity")]
+        public bool API_ProtectEntity(BaseEntity entity, string source = null)
+        {
+            if (entity?.net == null || entity.IsDestroyed)
+            {
+                return false;
+            }
+
+            _registeredProtectedEntities.Add((uint)entity.net.ID.Value);
+            return true;
+        }
+
+        [HookMethod("API_UnprotectEntity")]
+        public bool API_UnprotectEntity(BaseEntity entity, string source = null)
+        {
+            return entity?.net != null && _registeredProtectedEntities.Remove((uint)entity.net.ID.Value);
+        }
+
+        private void RegisterRaidableBasePayload(object payload)
+        {
+            var values = payload as object[];
+            if (values == null || values.Length <= 11)
+            {
+                return;
+            }
+
+            var entities = values[11] as IEnumerable<BaseEntity>;
+            if (entities == null)
+            {
+                return;
+            }
+
+            foreach (var entity in entities)
+            {
+                API_ProtectEntity(entity, "RaidableBases");
+            }
+        }
+
+        private void UnregisterRaidableBasePayload(object payload)
+        {
+            var values = payload as object[];
+            if (values == null || values.Length <= 11)
+            {
+                return;
+            }
+
+            var entities = values[11] as IEnumerable<BaseEntity>;
+            if (entities == null)
+            {
+                return;
+            }
+
+            foreach (var entity in entities)
+            {
+                API_UnprotectEntity(entity, "RaidableBases");
+            }
+        }
 
         private bool IsProtectedByRecentActivity(ulong ownerId)
         {
@@ -1251,7 +1936,9 @@ namespace Oxide.Plugins
                    $"Tracked={totalTracked}, Buildings={trackedBuildings}, Deployables={trackedDeployables}, " +
                    $"Interval={_runtime.ScheduledEvaluationIntervalMinutes:0.##}m, Batch={_runtime.MaxCandidatesPerTick}, " +
                    $"OutsideHours(Buildings/Deployables)={_runtime.DisconnectedStructuresCleanupHours:0.##}/{_runtime.DeployablesOutsidePrivilegeCleanupHours:0.##}, " +
-                   $"ProtectRecentOwners={_runtime.ProtectRecentlyActivePlayersHours:0.##}h, Running={_runInProgress}.";
+                   $"ProtectRecentOwners={_runtime.ProtectRecentlyActivePlayersHours:0.##}h, Events={_config.EventSafety.Enabled}, " +
+                   $"ScheduledDisabled={_config.AdvancedTesting.DisableScheduledCleanupForTesting || _configLoadFailed}, " +
+                   $"Running={_runInProgress}, Rebuilding={_rebuildInProgress}.";
         }
 
         private void Broadcast(string message)
@@ -1366,8 +2053,11 @@ namespace Oxide.Plugins
             }
             catch (Exception ex)
             {
-                PrintError($"Failed to read config, generating defaults. Error: {ex.Message}");
+                _configLoadFailed = true;
+                BackupInvalidConfig();
+                PrintError($"Failed to read config. The invalid file was backed up and safe testing defaults were generated. Error: {ex.Message}");
                 LoadDefaultConfig();
+                _config.AdvancedTesting.DisableScheduledCleanupForTesting = true;
                 migrated = true;
             }
 
@@ -1382,6 +2072,26 @@ namespace Oxide.Plugins
             }
 
             SaveConfig();
+        }
+
+        private void BackupInvalidConfig()
+        {
+            try
+            {
+                var source = Path.Combine(Interface.Oxide.ConfigDirectory, $"{Name}.json");
+                if (!File.Exists(source))
+                {
+                    return;
+                }
+
+                var backup = Path.Combine(Interface.Oxide.ConfigDirectory, $"{Name}.invalid-{DateTime.UtcNow:yyyyMMdd-HHmmss}.json.bak");
+                File.Copy(source, backup, false);
+                PrintWarning($"Backed up the unreadable configuration to {Path.GetFileName(backup)}.");
+            }
+            catch (Exception ex)
+            {
+                PrintError($"Could not back up the unreadable configuration: {ex.Message}");
+            }
         }
 
         private bool ApplyConfigDefaultsAndMigrations()
@@ -1428,6 +2138,12 @@ namespace Oxide.Plugins
             if (_config.AdvancedSafety == null)
             {
                 _config.AdvancedSafety = defaults.AdvancedSafety;
+                changed = true;
+            }
+
+            if (_config.EventSafety == null)
+            {
+                _config.EventSafety = defaults.EventSafety;
                 changed = true;
             }
 
@@ -1546,6 +2262,36 @@ namespace Oxide.Plugins
                 changed = true;
             }
 
+            if (_config.AdvancedPerformance.IndexCandidatesPerTick <= 0)
+            {
+                _config.AdvancedPerformance.IndexCandidatesPerTick = defaults.AdvancedPerformance.IndexCandidatesPerTick;
+                changed = true;
+            }
+
+            if (_config.AdvancedPerformance.DataSaveIntervalMinutes <= 0d)
+            {
+                _config.AdvancedPerformance.DataSaveIntervalMinutes = defaults.AdvancedPerformance.DataSaveIntervalMinutes;
+                changed = true;
+            }
+
+            if (_config.AdvancedPerformance.ReconciliationIntervalHours < 0d)
+            {
+                _config.AdvancedPerformance.ReconciliationIntervalHours = defaults.AdvancedPerformance.ReconciliationIntervalHours;
+                changed = true;
+            }
+
+            if (_config.EventSafety.CopyPasteProtectionHours < 0d)
+            {
+                _config.EventSafety.CopyPasteProtectionHours = defaults.EventSafety.CopyPasteProtectionHours;
+                changed = true;
+            }
+
+            if (_config.EventSafety.ProtectedSkinIds == null)
+            {
+                _config.EventSafety.ProtectedSkinIds = defaults.EventSafety.ProtectedSkinIds;
+                changed = true;
+            }
+
             return changed;
         }
 
@@ -1556,7 +2302,7 @@ namespace Oxide.Plugins
 
         private class ConfigData
         {
-            public const int CurrentConfigVersion = 6;
+            public const int CurrentConfigVersion = 7;
 
             [JsonProperty("Config Version")]
             public int ConfigVersion = CurrentConfigVersion;
@@ -1578,6 +2324,9 @@ namespace Oxide.Plugins
 
             [JsonProperty("Advanced Safety")]
             public AdvancedSafety AdvancedSafety = new AdvancedSafety();
+
+            [JsonProperty("Event Safety")]
+            public EventSafety EventSafety = new EventSafety();
 
             [JsonProperty("Advanced Thresholds")]
             public AdvancedThresholds AdvancedThresholds = new AdvancedThresholds();
@@ -1697,6 +2446,36 @@ namespace Oxide.Plugins
 
             [JsonProperty("Protect Recently Active Players Hours")]
             public double ProtectRecentlyActivePlayersHours = 72d;
+
+            [JsonProperty("Override Profile Recent Activity Protection")]
+            public bool OverrideProfileRecentActivityProtection = false;
+
+            [JsonProperty("Protect Entire Connected Structure")]
+            public bool ProtectEntireConnectedStructure = true;
+        }
+
+        private class EventSafety
+        {
+            [JsonProperty("Enabled")]
+            public bool Enabled = true;
+
+            [JsonProperty("Use Known Plugin Integrations")]
+            public bool UseKnownPluginIntegrations = true;
+
+            [JsonProperty("Protect Unsaved Entities")]
+            public bool ProtectUnsavedEntities = true;
+
+            [JsonProperty("Protect Non-Steam Owned Entities")]
+            public bool ProtectNonSteamOwnedEntities = true;
+
+            [JsonProperty("Protect Entities Inside Monuments")]
+            public bool ProtectEntitiesInsideMonuments = true;
+
+            [JsonProperty("CopyPaste Protection Hours")]
+            public double CopyPasteProtectionHours = 24d;
+
+            [JsonProperty("Protected Skin IDs")]
+            public ulong[] ProtectedSkinIds = { 3710562502UL, 755446UL };
         }
 
         private class AdvancedThresholds
@@ -1706,12 +2485,27 @@ namespace Oxide.Plugins
 
             [JsonProperty("Inside Privilege Health Fraction Threshold (0 = Ignore Health)")]
             public float InsidePrivilegeHealthFractionThreshold = 0f;
+
+            [JsonProperty("Override Profile Health Thresholds")]
+            public bool OverrideProfileHealthThresholds = false;
         }
 
         private class AdvancedPerformance
         {
             [JsonProperty("Max Candidates Per Tick")]
             public int MaxCandidatesPerTick = 100;
+
+            [JsonProperty("Override Profile Batch Size")]
+            public bool OverrideProfileBatchSize = false;
+
+            [JsonProperty("Index Candidates Per Tick")]
+            public int IndexCandidatesPerTick = 500;
+
+            [JsonProperty("Reconciliation Interval Hours (0 = Disabled)")]
+            public double ReconciliationIntervalHours = 6d;
+
+            [JsonProperty("Persistent State Save Interval Minutes")]
+            public double DataSaveIntervalMinutes = 5d;
         }
 
         private class AdvancedLogging

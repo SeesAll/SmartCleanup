@@ -1,154 +1,100 @@
-# SmartCleanup (Rust / uMod Plugin)
+# SmartCleanup (Rust / Carbon and uMod Plugin)
 
-**Author:** SeesAll\
-**Version:** 0.3.1
+**Author:** SeesAll
 
-SmartCleanup is a modern replacement for legacy Rust cleanup plugins
-such as EntityCleanup. It safely removes abandoned structures and
-deployables while protecting legitimate player builds.
+**Version:** 0.4.0
 
-------------------------------------------------------------------------
+SmartCleanup is a safety-first replacement for legacy Rust cleanup plugins such as EntityCleanup. It identifies abandoned structures and selected deployables without repeatedly scanning and mutating the server's entire entity collection.
 
-## Why SmartCleanup Exists
+## Highlights
 
-Older cleanup plugins treated all deployables the same which could lead
-to: - accidental removal of legitimate player storage - unsafe cleanup
-inside base areas - unnecessary performance overhead
+- Building and deployable cleanup with category controls
+- Fast PvP, Balanced, PvE/Conservative, Custom, and auto-detected profiles
+- Persistent entity age and owner-activity state across reloads/restarts
+- Bounded startup/reconciliation indexing and cleanup batches
+- Dry-run required before a manual destructive run
+- Whole-building protection when any connected part is protected
+- Event protection for RaidableBases, AirfieldEvent, MonumentAddons, CopyPaste, monument entities, unsaved entities, non-Steam owners, and configured skin IDs
+- Extensible protection API for present and future event plugins
+- Invalid-config backup and fail-safe scheduled-cleanup shutdown
 
-SmartCleanup introduces category-aware cleanup, safer privilege
-detection, and performance-focused evaluation.
+## Safety Model
 
-------------------------------------------------------------------------
+SmartCleanup checks protections before cleanup eligibility. By default it protects:
 
-## Key Features
+- whitelisted and never-clean prefabs;
+- recently active owners;
+- entities inside TC privilege and TC-authorized owners;
+- an entire connected building when any part of it is protected;
+- event and monument entities;
+- unsaved or plugin-owned entities;
+- entities registered by another plugin.
 
-### Intelligent Cleanup Categories
+The default monument protection is intentionally conservative. If a server deliberately wants abandoned player deployables inside monuments cleaned, disable `Protect Entities Inside Monuments` only after testing with all installed event plugins.
 
-Server owners can control which deployable types are eligible for
-cleanup:
+## Profiles and Overrides
 
--   Production deployables (furnaces, BBQs, campfires)
--   Lighting deployables (lanterns, tuna lamps)
--   Traps (bear traps, landmines, spike traps)
--   Utility deployables
--   Water and farming deployables
--   Electrical and industrial deployables
--   Storage deployables
--   Workbench deployables
--   Privilege deployables
--   Commerce deployables
+1. Auto Detect
+2. Fast PvP
+3. Balanced
+4. PvE / Conservative
+5. Custom
 
-------------------------------------------------------------------------
-
-### Safety Systems
-
-SmartCleanup includes multiple layers of protection:
-
--   TC privilege detection
--   Connected structure protection
--   Recent player activity protection
--   Health thresholds
--   Never-clean prefab list
--   Force-allow prefab list
-
-These systems prevent accidental cleanup of legitimate bases.
-
-------------------------------------------------------------------------
-
-### Server Profiles
-
-SmartCleanup supports preset environments:
-
-1.  Auto Detect
-2.  Fast PvP
-3.  Balanced
-4.  PvE / Conservative
-5.  Custom
-
-Profiles automatically adjust cleanup timings based on server style.
-
-------------------------------------------------------------------------
-
-### Performance-Focused Design
-
-Compared to older cleanup plugins SmartCleanup improves performance by:
-
--   Tracking cleanup candidates instead of repeatedly scanning all
-    entities
--   Evaluating entities in controlled batches
--   Running scheduled checks at configurable intervals
--   Avoiding unnecessary processing of protected structures
-
-This design scales significantly better on medium and large Rust
-servers.
-
-------------------------------------------------------------------------
-
-### Logging Controls
-
-Admins can choose how much information appears in console:
-
--   Debug logging
--   Scheduled cleanup summaries
--   Removal-only logging (recommended for production)
-
-------------------------------------------------------------------------
-
-## Default Always-Allow Cleanup Prefabs
-
-SmartCleanup always allows cleanup for common clutter deployables:
-
-    campfire
-    lantern.deployed
-    bbq.deployed
-
-These objects are frequently abandoned across the map and safe to remove
-when outside TC.
-
-------------------------------------------------------------------------
+Profile defaults now remain authoritative unless the matching `Override Profile ...` switch is enabled. Custom profile values are always taken from the advanced settings. `AutoTuneWriteToConfig` pins the detected profile when explicitly enabled; set `ServerProfile` back to `1` to resume automatic detection.
 
 ## Admin Commands
 
-    /smartcleanup status
-    /smartcleanup dryrun
-    /smartcleanup run
-    /smartcleanup rebuild
+Permission: `smartcleanup.admin`
 
-### Command Descriptions
+```text
+/smartcleanup status
+/smartcleanup dryrun
+/smartcleanup run confirm
+/smartcleanup retune
+/smartcleanup rebuild
+```
 
-  Command                 Description
-  ----------------------- ---------------------------------------------
-  /smartcleanup status    Shows current runtime configuration
-  /smartcleanup dryrun    Simulates cleanup without removing entities
-  /smartcleanup run       Executes cleanup immediately
-  /smartcleanup rebuild   Rebuilds the internal candidate tracker
+`dryrun` performs no removals. A successful manual dry-run opens a 120-second confirmation window for `run confirm`. Scheduled cleanup does not require this manual confirmation gate.
 
-------------------------------------------------------------------------
+## Event Plugin Integration
 
-## Testing Mode
+SmartCleanup has built-in conservative protection, but event authors can explicitly protect entities:
 
-For testing cleanup behaviour administrators can disable scheduled
-cleanup:
+```csharp
+SmartCleanup?.Call("API_ProtectEntity", entity, "MyEvent");
+SmartCleanup?.Call("API_UnprotectEntity", entity, "MyEvent");
+```
 
-    "Disable Scheduled Cleanup For Testing": true
+Alternatively, another plugin may block cleanup for an entity:
 
-------------------------------------------------------------------------
+```csharp
+private object CanSmartCleanupEntity(BaseEntity entity)
+{
+    return IsMyEventEntity(entity) ? (object)false : null;
+}
+```
 
-## Performance Notes
+Register event entities when the event starts and unregister them when it ends. Entity destruction is handled automatically.
 
-SmartCleanup was built with performance in mind.
+## Testing and Deployment
 
-Compared to legacy plugins it:
+For a first deployment, enable:
 
--   reduces full entity scans
--   processes entities in controlled batches
--   skips protected structures early
--   uses category filtering to minimize work
+```json
+"Disable Scheduled Cleanup For Testing": true
+```
 
-The result is a cleanup system that scales much better on long-wipe
-servers with large entity counts.
+Then reload SmartCleanup, wait for the bounded index rebuild to finish, check `/smartcleanup status`, and run `/smartcleanup dryrun`. Only disable testing mode after reviewing the dry-run totals and protected-reason breakdown.
 
-------------------------------------------------------------------------
+SmartCleanup stores runtime state in `oxide/data/SmartCleanup_State.json`. The state is reset automatically on a new Rust save. Configuration remains in `oxide/config/SmartCleanup.json` and is merged forward during schema upgrades.
+
+Never run SmartCleanup and another automatic entity cleanup plugin at the same time.
+
+## Default Cleanup Categories
+
+Production, lighting, and trap deployables are eligible by default. Storage, workbenches, privilege, commerce, electrical/industrial, water/farming, and utility deployables remain protected unless enabled in configuration.
+
+Default always-eligible clutter prefabs are `campfire`, `lantern.deployed`, and `bbq.deployed`; they still must pass age, location, activity, event, and other safety checks.
 
 ## License
 
